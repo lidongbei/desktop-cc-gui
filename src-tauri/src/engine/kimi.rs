@@ -140,6 +140,12 @@ impl Engine for KimiEngine {
         }
     }
 
+    /// 附加根只在新建会话的 `session/new {additionalDirectories}` 注入；
+    /// 续聊走 `session/load` 不带该字段。
+    fn supports_additional_roots(&self) -> super::AdditionalRoots {
+        super::AdditionalRoots::Session
+    }
+
     fn host_command(&self, _req: &SendRequest, bin: &str) -> Result<BuiltCommand, String> {
         let mut command = command_for_binary(bin);
         command.arg("acp");

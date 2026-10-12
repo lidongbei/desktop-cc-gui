@@ -339,6 +339,12 @@ impl Engine for CodexEngine {
         &["auto", "manual", "bypass", "plan"]
     }
 
+    /// 本机 app-server 走 `thread/start|resume {runtimeWorkspaceRoots}`
+    /// （每次发送都带，续聊同样生效）；WSL 的 exec 回退走 `--add-dir`。
+    fn supports_additional_roots(&self) -> super::AdditionalRoots {
+        super::AdditionalRoots::Full
+    }
+
     /// 人工计划审批走 next_turn 生命周期(turn/start collaborationMode.plan
     /// → 完整 plan item → 批准后原子创建一次 default 执行 turn),由本机
     /// app-server 传输兑现(见 codex_app.rs);exec/WSL fallback 没有这条
@@ -373,6 +379,23 @@ impl Engine for CodexEngine {
             return Err("记忆工具不支持远程工作区(WSL):注入的是本机程序".into());
         }
         let mut cmd = command_for_binary(bin);
+        // 工作区附加根（多根项目）→ `sandbox_workspace_write.writable_roots`。
+        // `--add-dir` 是顶层选项：必须放在 `exec`/`resume` 子命令之前才被解析
+        // （`exec resume --add-dir …` 会报 unexpected argument），放在这里同时
+        // 覆盖首发的 `exec` 与续聊的 `exec resume`。仅 workspace-write 需要：
+        // read-only 已可读全盘、bypass 无沙箱，都不追加可写根。
+        if matches!(self.resolve_permission(req.permission.as_deref()), "auto" | "plan") {
+            let workspace = req.workspace.to_string_lossy();
+            let mut seen = std::collections::HashSet::new();
+            for dir in &req.additional_dirs {
+                let dir = dir.trim();
+                if dir.is_empty() || dir == workspace || !seen.insert(dir.to_string()) {
+                    continue;
+                }
+                cmd.arg("--add-dir");
+                cmd.arg(dir);
+            }
+        }
         cmd.arg("exec");
         let mut preassigned = None;
         if let Some(session_id) = req.session_id.as_deref() {

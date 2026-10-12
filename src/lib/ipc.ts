@@ -266,6 +266,9 @@ export interface EngineInfo {
   /** 引擎能否兑现逐次调用的工具白名单（任务工作台只读节点）；
    *  不支持的引擎会被工作台阻止运行只读节点。 */
   supportsToolConstraints?: boolean;
+  /** 工作区附加根（多根项目）的兑现程度：`full` 全部根逐次发送都读写对等、
+   *  `session` 只在新建会话时生效、`none` 只用主目录。旧后端缺省视为 `none`。 */
+  supportsAdditionalRoots?: "full" | "session" | "none";
   /** 计划审批能力；旧后端/旧记录缺省视为不可用之外的既有行为。 */
   plan?: PlanApprovalInfo;
 }

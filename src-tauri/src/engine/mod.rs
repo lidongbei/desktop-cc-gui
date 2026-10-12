@@ -183,6 +183,19 @@ pub struct BuiltCommand {
     /// Session id assigned before spawn (grok `-s <uuid>`).
     pub preassigned_session_id: Option<String>,
 }
+/// 工作区附加根（多根项目）在某引擎上的兑现程度。后端是唯一事实源：前端据此
+/// 决定是否给多根轻提示，不再按引擎 id 特判。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AdditionalRoots {
+    /// 全部根读写对等，且每次发送（含续聊）都生效。
+    Full,
+    /// 只在新建会话时注入（ACP `session/new`）；续聊（`session/load`）不带。
+    Session,
+    /// 只用主目录，附加根不参与读写。
+    None,
+}
+
 /// Which transport one send uses. On `Own` the app spawns no engine child:
 /// the host driver task owns the process (or the connection) and settles the
 /// turn itself.
@@ -258,6 +271,12 @@ pub trait Engine: Send + Sync {
     /// spawn rather than silently running without the constraint.
     fn supports_tool_constraints(&self) -> bool {
         false
+    }
+    /// 工作区附加根（多根项目）在本引擎上的兑现程度；默认 `None`（只用主
+    /// 目录）。claude/agy 逐次发送注入到 argv，kimi/minimax 只在新建会话时
+    /// 注入，codex 两条传输都注入。前端据此决定多根轻提示文案。
+    fn supports_additional_roots(&self) -> AdditionalRoots {
+        AdditionalRoots::None
     }
     /// Permission modes this engine can honor at spawn ("auto" | "manual" |
     /// "plan" | "bypass"). These are one-shot headless launches that cannot
@@ -383,6 +402,10 @@ pub struct EngineInfo {
     /// Whether this engine can enforce a per-call tool whitelist (mission
     /// read-only nodes); the workbench blocks read-only nodes otherwise.
     pub supports_tool_constraints: bool,
+    /// 工作区附加根（多根项目）的兑现程度：`full` 全部根逐次发送都读写对等、
+    /// `session` 只在新建会话时生效、`none` 只用主目录。前端据此给出多根
+    /// 轻提示（`ConversationFooter`），完整支持者不提示。
+    pub supports_additional_roots: AdditionalRoots,
     /// Permission modes the engine honors at spawn; drives the composer
     /// picker's disabled options.
     pub permissions: Vec<String>,
@@ -470,6 +493,7 @@ fn list_engines_blocking() -> Vec<EngineInfo> {
                 supports_memory: engine.supports_memory(),
                 supports_effort: engine.supports_effort(),
                 supports_tool_constraints: engine.supports_tool_constraints(),
+                supports_additional_roots: engine.supports_additional_roots(),
                 permissions: engine
                     .supported_permissions()
                     .iter()
@@ -1888,6 +1912,33 @@ mod permission_tests {
         }
     }
 
+    /// 工作区附加根能力是显式声明：claude/agy/codex 每次发送都生效；kimi/
+    /// minimax 只在新建会话注入；其余引擎只用主目录。前端据此给多根提示。
+    #[test]
+    fn additional_root_support_is_explicit() {
+        use AdditionalRoots::*;
+        for (id, expected) in [
+            ("claude", Full),
+            ("agy", Full),
+            ("codex", Full),
+            ("kimi", Session),
+            ("minimax", Session),
+        ] {
+            assert_eq!(engine_by_id(id).unwrap().supports_additional_roots(), expected, "{id}");
+        }
+        for id in [
+            "grok",
+            "qoder",
+            "qoder-cn",
+            "opencode",
+            "dsh",
+            "omp",
+            "pi",
+        ] {
+            assert_eq!(engine_by_id(id).unwrap().supports_additional_roots(), None, "{id}");
+        }
+    }
+
     /// 工具白名单是显式能力：只有实现了约束的引擎才允许被任务工作台
     /// 用于只读节点，其余引擎必须在启动时被拒绝。
     #[test]
@@ -2141,11 +2192,13 @@ mod permission_tests {
             supports_memory: true,
             supports_effort: true,
             supports_tool_constraints: false,
+            supports_additional_roots: AdditionalRoots::Full,
             permissions: vec!["auto".into()],
         };
         let json = serde_json::to_value(&info).expect("EngineInfo serializes");
         assert_eq!(json["supportsComputerUse"], serde_json::json!(true));
         assert_eq!(json["supportsMemory"], serde_json::json!(true));
+        assert_eq!(json["supportsAdditionalRoots"], serde_json::json!("full"));
         assert!(json.get("supports_computer_use").is_none());
     }
 
@@ -2523,9 +2576,47 @@ mod permission_tests {
         assert_eq!(pairs.len(), 1, "{args:?}");
         assert_eq!(pairs[0][1], "/data/shared");
 
-        // Other engines have no equivalent flag: the field stays inert.
-        let codex_args = argv(&codex::CodexEngine, &r);
-        assert!(!codex_args.iter().any(|a| a == "--add-dir"));
+        // Codex 另有等价入口（顶层 --add-dir），形状与去重见
+        // codex_exec_passes_additional_roots_as_global_add_dir。
+    }
+
+    /// Codex 的 exec/WSL 回退把附加根作为顶层 `--add-dir` 注入（必须落在
+    /// `exec`/`resume` 子命令之前才被解析），仅 workspace-write 需要；空白、
+    /// 主目录本身与重复项都不得进入 argv，且只读/绕过沙箱不注入。
+    #[test]
+    fn codex_exec_passes_additional_roots_as_global_add_dir() {
+        let mut r = req(Some("auto"));
+        r.workspace = PathBuf::from("/ws");
+        r.additional_dirs = vec![
+            "/ws/extra".to_string(),
+            "/ws".to_string(),          // 主目录本身
+            "  ".to_string(),            // 空白
+            "/ws/extra".to_string(),     // 重复
+        ];
+        let args = argv(&codex::CodexEngine, &r);
+        let pairs: Vec<&[String]> = args.windows(2).filter(|w| w[0] == "--add-dir").collect();
+        assert_eq!(pairs.len(), 1, "{args:?}");
+        assert_eq!(pairs[0][1], "/ws/extra");
+        // 顶层位置：--add-dir 出现在 `exec` 子命令之前。
+        let pos_add = args.iter().position(|a| a == "--add-dir").unwrap();
+        let pos_exec = args.iter().position(|a| a == "exec").unwrap();
+        assert!(pos_add < pos_exec, "{args:?}");
+
+        // manual（read-only）与 bypass 不注入任何可写根。
+        for mode in ["manual", "bypass"] {
+            let mut ro = req(Some(mode));
+            ro.workspace = PathBuf::from("/ws");
+            ro.additional_dirs = vec!["/ws/extra".to_string()];
+            let args = argv(&codex::CodexEngine, &ro);
+            assert!(!args.iter().any(|a| a == "--add-dir"), "{mode}: {args:?}");
+        }
+
+        // 空表不产生任何参数。
+        let mut empty = req(Some("auto"));
+        empty.workspace = PathBuf::from("/ws");
+        empty.additional_dirs = Vec::new();
+        let args = argv(&codex::CodexEngine, &empty);
+        assert!(!args.iter().any(|a| a == "--add-dir"), "{args:?}");
     }
 
     #[test]

@@ -124,6 +124,8 @@ export const zh = {
     multiRootBadgeTooltip: "此工作区包含 {{count}} 个目录（主目录 + 附加目录）",
     engineNoMultiRoot:
       "当前引擎（{{engine}}）只使用主目录，附加目录在本会话不可读写。改用 Claude 引擎可用全部目录。",
+    engineNoMultiRootSession:
+      "当前引擎（{{engine}}）只在新建会话时使用附加目录，已开始的会话不读取它们；需要完整生效请改用 Claude 或 Codex 引擎，或新建会话。",
     newGroup: "新建分组",
     inputPlaceholder: "输入消息，Enter 发送，Shift+Enter 换行，或 @引用、#智能体",
     inputPlaceholderCmdEnter: "输入消息，Cmd+Enter 发送，或 @引用、#智能体",

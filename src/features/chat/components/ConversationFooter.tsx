@@ -20,6 +20,7 @@ import { QuestionDock, usePendingQuestion } from "./QuestionDock";
 import { PlanReviewDock, usePendingPlanReview } from "./PlanReviewDock";
 import { ErrorBanner } from "./ErrorBanner";
 import { sessionKey } from "../store";
+import { additionalRootsSupport } from "../multi-root";
 import { centerColumnClass } from "../chat-column";
 import { ComposerSlotExtras } from "@/features/plugins/boundary/composer-slot-extras";
 import { COMPOSER_DRAFT_TOPIC, pluginBus } from "@/features/plugins/runtime/events";
@@ -145,17 +146,22 @@ function ActiveRunStatus({ active }: { active: ActiveSession | null }) {
   );
 }
 
-/** 工作区多目录:非 claude 引擎只用主目录的轻提示。仅在「激活工作区含附加根
- *  且当前引擎非 claude(仅 claude 会把附加根注入为可读写目录)」时出现;纯提示,
- *  不阻塞输入与发送(非 claude 仍照常只用主目录)。 */
+/** 工作区多目录:按引擎「附加根兑现程度」给轻提示。仅在「激活工作区含附加根
+ *  且当前引擎非完整支持」时出现;`full` 不提示(读写全部根),`session` 提示
+ *  「仅新建会话生效」,`none` 提示「只用主目录」。纯提示,不阻塞输入与发送。 */
 function MultiRootEngineNotice({ workspacePath }: { workspacePath: string }) {
   const { t } = useTranslation();
   const extraRoots = useChatStore(
     (s) => s.workspaces.find((w) => w.path === workspacePath)?.roots?.length ?? 0,
   );
   const engine = useChatStore((s) => s.activeEngine);
-  if (extraRoots === 0 || engine === "claude") return null;
+  const engines = useChatStore((s) => s.engines);
+  if (extraRoots === 0) return null;
+  const support = additionalRootsSupport(engines, engine);
+  if (support === "full") return null;
   const engineName = CLI_DISPLAY_NAMES[engine] ?? engine;
+  const key =
+    support === "session" ? "chat.engineNoMultiRootSession" : "chat.engineNoMultiRoot";
   return (
     <div className="mx-auto w-full max-w-3xl">
       <div
@@ -163,7 +169,7 @@ function MultiRootEngineNotice({ workspacePath }: { workspacePath: string }) {
         className="flex items-start gap-2 rounded-lg bg-background-secondary-default px-2.5 py-1.5 text-caption-1-regular text-text-secondary"
       >
         <Info aria-hidden className="mt-0.5 size-3.5 shrink-0 text-foreground-icon-tertiary" />
-        <span>{t("chat.engineNoMultiRoot", { engine: engineName })}</span>
+        <span>{t(key, { engine: engineName })}</span>
       </div>
     </div>
   );

@@ -129,6 +129,8 @@ export const en: Messages = {
     multiRootBadgeTooltip: "This workspace has {{count}} folders (main + extra)",
     engineNoMultiRoot:
       "The current engine ({{engine}}) only uses the main folder; extra folders are not readable in this session. Switch to the Claude engine to use every folder.",
+    engineNoMultiRootSession:
+      "The current engine ({{engine}}) only applies extra folders to new sessions; an in-progress session does not read them. Switch to the Claude or Codex engine, or start a new session, for full support.",
     newGroup: "New group",
     inputPlaceholder: "Type a message. Enter to send, Shift+Enter for newline, or @ to reference, # for agents",
     inputPlaceholderCmdEnter: "Type a message. Cmd+Enter to send, or @ to reference, # for agents",

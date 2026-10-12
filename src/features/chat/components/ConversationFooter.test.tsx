@@ -179,9 +179,9 @@ describe("ConversationFooter 自动压缩续接", () => {
   });
 });
 
-/** 工作区多目录:非 claude 引擎只用主目录的轻提示。仅当「激活工作区含附加根
- *  且当前引擎非 claude」时出现;claude 或单目录都不显示。 */
-describe("ConversationFooter 非 claude 多根轻提示", () => {
+/** 工作区多目录:按引擎「附加根兑现程度」给轻提示。`full` 不提示(读写全部
+ *  根),`session` 提示「仅新建会话生效」,`none` 提示「只用主目录」。 */
+describe("ConversationFooter 多根轻提示(按引擎能力)", () => {
   const WS_MULTI = {
     id: "w1",
     path: WS,
@@ -192,22 +192,23 @@ describe("ConversationFooter 非 claude 多根轻提示", () => {
     roots: ["/tmp/extra"],
   };
 
-  function setMultiRoot(engine: string) {
+  function setMultiRoot(engine: string, support: "full" | "session" | "none") {
     useChatStore.setState({
       activeEngine: engine,
+      engines: [{ id: engine, supportsAdditionalRoots: support } as never],
       workspaces: [WS_MULTI as never],
     });
   }
 
-  it("非 claude + 有附加根 → 显示提示,且不阻塞 composer(提交按钮仍在)", async () => {
-    setMultiRoot("codex");
+  it("能力为 none + 有附加根 → 显示「只用主目录」提示,且不阻塞 composer", async () => {
+    setMultiRoot("grok", "none");
     await act(async () => {
       // 有草稿(可发送)时仍不被提示禁用——轻提示不阻塞输入/发送。
       root.render(<ConversationFooter {...footerProps()} draft="hi" />);
     });
     expect(
       document.body.textContent?.includes(
-        i18n.t("chat.engineNoMultiRoot", { engine: "Codex CLI" }),
+        i18n.t("chat.engineNoMultiRoot", { engine: "Grok CLI" }),
       ),
     ).toBe(true);
     // 轻提示:输入框不被提示禁用(不阻塞)。
@@ -217,15 +218,41 @@ describe("ConversationFooter 非 claude 多根轻提示", () => {
     ).not.toBe(true);
   });
 
-  it("claude + 有附加根 → 不显示提示(claude 读写全部根)", async () => {
-    setMultiRoot("claude");
+  it("能力为 session + 有附加根 → 显示「仅新建会话生效」提示", async () => {
+    setMultiRoot("kimi", "session");
     await act(async () => {
       root.render(<ConversationFooter {...footerProps()} />);
     });
     expect(
       document.body.textContent?.includes(
-        i18n.t("chat.engineNoMultiRoot", { engine: "Claude Code" }),
+        i18n.t("chat.engineNoMultiRootSession", { engine: "Kimi CLI" }),
+      ),
+    ).toBe(true);
+    // 不该同时出现「只用主目录」的旧文案。
+    expect(
+      document.body.textContent?.includes(
+        i18n.t("chat.engineNoMultiRoot", { engine: "Kimi CLI" }),
       ),
     ).toBe(false);
+  });
+
+  it.each(["claude", "codex", "agy"])("能力为 full(%s) → 不显示提示", async (engine) => {
+    setMultiRoot(engine, "full");
+    await act(async () => {
+      root.render(<ConversationFooter {...footerProps()} />);
+    });
+    expect(document.body.querySelector('[role="note"]')).toBeNull();
+  });
+
+  it("单目录工作区 → 不显示提示", async () => {
+    useChatStore.setState({
+      activeEngine: "grok",
+      engines: [{ id: "grok", supportsAdditionalRoots: "none" } as never],
+      workspaces: [{ ...WS_MULTI, roots: [] } as never],
+    });
+    await act(async () => {
+      root.render(<ConversationFooter {...footerProps()} />);
+    });
+    expect(document.body.querySelector('[role="note"]')).toBeNull();
   });
 });

@@ -68,6 +68,11 @@ impl Engine for ClaudeEngine {
         true
     }
 
+    /// 工作区附加根随每次启动的 `--add-dir` 注入，续聊同样生效。
+    fn supports_additional_roots(&self) -> super::AdditionalRoots {
+        super::AdditionalRoots::Full
+    }
+
     fn build_command(&self, req: &SendRequest, bin: &str) -> Result<BuiltCommand, String> {
         let mut cmd = command_for_binary(bin);
         cmd.arg("-p");

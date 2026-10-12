@@ -11,8 +11,8 @@
 //! answer command writes when the user picks an option.
 //!
 //! Wire (verified against the installed CLI, whose shipped JSON schema is the
-//! source of truth here): `initialize {clientInfo}` → `thread/start
-//! {cwd, sandbox, approvalPolicy}` (or `thread/resume {threadId, excludeTurns}`
+//! source of truth here): `initialize {clientInfo, capabilities}` → `thread/start
+//! {cwd, permissions, approvalPolicy}` (or `thread/resume {threadId, excludeTurns}`
 //! for a session the app already holds) → `turn/start {threadId, input}`, which
 //! acknowledges immediately with `{turn:{id}}`; the work then streams as `item/*` and
 //! `item/agentMessage/delta` notifications and only `turn/completed` ends the
@@ -850,12 +850,32 @@ fn question_cards(params: &Value) -> (Vec<Value>, Value) {
 /// Sandbox mode for the run's permission. Mirrors `codex.rs`, whose `_` arm is
 /// also what `resolve_permission`'s first-supported fallback lands on, so an
 /// unsupported mode here behaves exactly like it does on the exec path.
+#[cfg(test)]
 fn sandbox_for(permission: Option<&str>) -> &'static str {
     match permission {
         Some("bypass") => "danger-full-access",
         Some("manual") => "read-only",
         Some(codex_read_only::PERMISSION) => "read-only",
         _ => "workspace-write",
+    }
+}
+
+/// 命名权限档 id：codex 0.158 的 `permissions` 字段（实验性，需
+/// `experimentalApi`）。读侧的三个档 `:read-only`/`:workspace`/
+/// `:danger-full-access` 由 `permissionProfile/list` 内建提供。
+///
+/// 为什么不直接发 `sandbox` 模式：**0.158 在 Windows 上把
+/// `sandbox:"workspace-write"` 静默降级成 read-only**（实测：thread/start
+/// 后 turn_context.sandbox_policy 恒为 read-only），导致 auto 权限下工作区
+/// 也不可写；`permissions:":workspace"` 才真正生效，并把
+/// `runtimeWorkspaceRoots` 一并并入 `writable_roots`。danger-full-access
+/// 两写法等价，但统一走 permissions 以免再踩同类降级。
+fn permission_profile_for(permission: Option<&str>) -> &'static str {
+    match permission {
+        Some("bypass") => ":danger-full-access",
+        Some("manual") => ":read-only",
+        Some(codex_read_only::PERMISSION) => ":read-only",
+        _ => ":workspace",
     }
 }
 
@@ -1386,12 +1406,11 @@ async fn handshake_and_start(
     // schema: the client must opt into the experimental API to negotiate
     // them. If the server then refuses the fields, the rpc error fails the
     // turn — there is no degraded fallback.
-    // Codex 0.150 requires this opt-in for `thread/resume.excludeTurns`;
-    // the field is stable from 0.151, which also accepts the capability.
-    let experimental = req.session_id.is_some()
-        || codex_read_only::requested(req)
-        || decision.is_some()
-        || req.permission.as_deref() == Some("plan");
+    // Every thread now carries `permissions` (the named profile) and — with
+    // 附加根 — `runtimeWorkspaceRoots`; both are experimental-only, so the
+    // capability is always declared. `thread/resume.excludeTurns` (0.150+)
+    // needs it too, so the old conditional gate is subsumed.
+    let experimental = true;
     let key = server
         .request(
             "initialize",
@@ -1460,7 +1479,10 @@ async fn handshake_and_start(
         };
     let (method, mut params) = thread_open_request(req.session_id.as_deref());
     params["cwd"] = json!(req.workspace.to_string_lossy());
-    params["sandbox"] = json!(sandbox_for(req.permission.as_deref()));
+    // 命名权限档（实验性）而非 `sandbox` 模式：Windows 上 0.158 把
+    // `sandbox:"workspace-write"` 静默降级为 read-only，只有 `permissions`
+    // 才真正生效（见 permission_profile_for）。
+    params["permissions"] = json!(permission_profile_for(req.permission.as_deref()));
     params["approvalPolicy"] = json!("never");
     if codex_read_only::requested(req) {
         params["ephemeral"] = json!(true);
@@ -1469,6 +1491,7 @@ async fn handshake_and_start(
         params["environments"] =
             json!([{"environmentId":"local","cwd":req.workspace.to_string_lossy()}]);
     }
+    apply_runtime_workspace_roots(&mut params, req);
     if let Some(model) = req.model.as_deref() {
         params["model"] = json!(model);
     }
@@ -1615,6 +1638,32 @@ fn thread_open_request(session_id: Option<&str>) -> (&'static str, Value) {
             json!({ "threadId": thread_id, "excludeTurns": true }),
         ),
         None => ("thread/start", json!({})),
+    }
+}
+
+/// 是否要把工作区附加根写进 `runtimeWorkspaceRoots`：有根、且不是只读隔离
+/// 会话（`codex_read_only`，含插件只读与计划审批执行回合——它走完全隔离的
+/// 契约，刻意不把任何附加目录写进沙箱）。`initialize` 的能力声明与 thread
+/// 参数注入共用这一个判据，两处必须一致：该字段只在实验面被接受，声明与注入
+/// 一旦错位，服务端就会以 `…requires experimentalApi capability` 拒绝。
+fn wants_runtime_workspace_roots(req: &SendRequest) -> bool {
+    !req.additional_dirs.is_empty() && !codex_read_only::requested(req)
+}
+
+/// 工作区附加根（多根项目）→ `runtimeWorkspaceRoots`：`thread/start` 与
+/// `thread/resume` 都接受（需 `experimentalApi`，见 `wants_runtime_workspace_roots`），
+/// 续聊同样生效；路径必须绝对（`prepare_launch` 已过滤）。已实测 0.158.0
+/// 服务端接受该字段并在 `thread.environments` 回显。空表不写——在
+/// `thread/resume` 上写空数组会把线程原有的根清掉。
+fn apply_runtime_workspace_roots(params: &mut Value, req: &SendRequest) {
+    if !wants_runtime_workspace_roots(req) {
+        return;
+    }
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert(
+            "runtimeWorkspaceRoots".to_string(),
+            json!(req.additional_dirs),
+        );
     }
 }
 
@@ -2009,6 +2058,53 @@ mod tests {
         }
     }
 
+    /// 工作区附加根写进 `runtimeWorkspaceRoots`：非只读且非空才写；只读隔离
+    /// 与空表都不写（空表尤其不能在 `thread/resume` 上清掉线程原有的根）。
+    #[test]
+    fn runtime_workspace_roots_written_only_for_non_read_only_non_empty() {
+        let mut req = SendRequest {
+            session_id: None,
+            workspace: PathBuf::from("/ws"),
+            prompt: "hi".into(),
+            prompt_contributions: Vec::new(),
+            native_compact: false,
+            images: vec![],
+            model: None,
+            effort: None,
+            service_tier: None,
+            permission: Some("auto".into()),
+            additional_dirs: vec!["/ws/extra".into(), "/data/shared".into()],
+            provider_id: None,
+            computer_use: None,
+            memory_bot: None,
+            allowed_tools: None,
+        };
+        let mut params = json!({ "cwd": "/ws" });
+        apply_runtime_workspace_roots(&mut params, &req);
+        assert_eq!(
+            params["runtimeWorkspaceRoots"],
+            json!(["/ws/extra", "/data/shared"])
+        );
+        // 能力声明与注入共用判据：有根即需要在 initialize 打开 experimentalApi。
+        assert!(wants_runtime_workspace_roots(&req));
+
+        // 空表不写字段（避免在 resume 上清根），也不声明实验能力。
+        let mut empty = json!({ "cwd": "/ws" });
+        req.additional_dirs = Vec::new();
+        apply_runtime_workspace_roots(&mut empty, &req);
+        assert!(empty.get("runtimeWorkspaceRoots").is_none());
+        assert!(!wants_runtime_workspace_roots(&req));
+
+        // 只读隔离会话绝不写，也不为附加根声明实验能力。
+        let mut ro = json!({ "cwd": "/ws" });
+        let mut ro_req = req.clone();
+        ro_req.additional_dirs = vec!["/ws/extra".into()];
+        ro_req.permission = Some(codex_read_only::PERMISSION.into());
+        apply_runtime_workspace_roots(&mut ro, &ro_req);
+        assert!(ro.get("runtimeWorkspaceRoots").is_none());
+        assert!(!wants_runtime_workspace_roots(&ro_req));
+    }
+
     /// A TurnCore with a registry entry under its run id (so question parking
     /// has somewhere to land) plus the collected flushes for assertions.
     fn test_core() -> (TurnCore, Arc<ProcessRegistry>, Arc<CollectingEmitter>) {
@@ -2372,6 +2468,19 @@ mod tests {
         assert_eq!(sandbox_for(None), "workspace-write");
     }
 
+    /// 权限 → 命名档：Windows 上 `sandbox:"workspace-write"` 被静默降级成
+    /// read-only，只有 `permissions:":workspace"` 才真正可写，故 auto 必须落
+    /// 到它；只读与 bypass 与各自的沙箱等价档对齐存在。
+    #[test]
+    fn permission_profile_maps_auto_to_workspace_not_read_only() {
+        assert_eq!(permission_profile_for(Some("bypass")), ":danger-full-access");
+        assert_eq!(permission_profile_for(Some("manual")), ":read-only");
+        assert_eq!(permission_profile_for(Some(codex_read_only::PERMISSION)), ":read-only");
+        assert_eq!(permission_profile_for(Some("auto")), ":workspace");
+        assert_eq!(permission_profile_for(Some("plan")), ":workspace");
+        assert_eq!(permission_profile_for(None), ":workspace");
+    }
+
     #[test]
     fn resumed_threads_skip_full_history_hydration() {
         let (method, params) = thread_open_request(Some("thread-123"));
@@ -2401,11 +2510,12 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
   assert.equal(method, methods[step++]);
   let result;
   if (method === 'initialize') {
-    assert.equal(params.capabilities.experimentalApi, resumed);
+    assert.equal(params.capabilities.experimentalApi, true);
     result = {};
   } else if (method === 'thread/resume' || method === 'thread/start') {
     assert.equal(params.approvalPolicy, 'never');
-    assert.equal(params.sandbox, 'workspace-write');
+    assert.equal(params.permissions, ':workspace');
+    assert.equal(params.sandbox, undefined);
     assert.equal(params.excludeTurns, resumed ? true : undefined);
     assert.equal(params.threadId, resumed ? 'thread-123' : undefined);
     assert.equal(params.history, undefined);
